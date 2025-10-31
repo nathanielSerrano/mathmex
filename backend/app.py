@@ -17,7 +17,18 @@ import saytex
 import os
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from utils.format import format_for_mathmex, format_for_mathlive
+from utils.format import format_for_mathmex, format_for_mathlive, format_for_tangent_cft_search
+import sys
+import faiss
+
+import traceback
+
+
+sys.path.append(os.path.expanduser("../../formula-search"))
+
+from tangent_cft_back_end import TangentCFTBackEnd
+
+
 
 # Create the Flask application instance
 app = Flask(__name__)
@@ -32,13 +43,14 @@ load_dotenv()
 config = configparser.ConfigParser()
 config.read( os.getenv("BACKEND_CONFIG") )
 
+
 # OpenSearch Client Configuration from file
 OPENSEARCH_HOST = config.get('opensearch', 'host')
 OPENSEARCH_PORT = config.getint('opensearch', 'port') # Use getint for numbers
-OPENSEARCH_USER = config.get('opensearch', 'admin_user')
-OPENSEARCH_PASSWORD = config.get('opensearch', 'admin_password')
-INDEX_NAME = config.get('opensearch', 'index_name')
-MODEL = config.get('opensearch', 'model')
+OPENSEARCH_USER = config.get('dev', 'user')
+OPENSEARCH_PASSWORD = config.get('dev', 'password')
+# INDEX_NAME = config.get('opensearch', 'index_name')
+MODEL = config.get('general', 'model')
 
 # Flask App Configuration from file
 FLASK_PORT = config.getint('flask_app', 'port')
@@ -53,6 +65,34 @@ client = OpenSearch(
     ssl_show_warn=False
 )
 
+# TangentCFT Model
+backend = TangentCFTBackEnd(
+    config_file=None,
+    path_data_set=None,
+    is_wiki=False, # MSE model
+    streaming=True,
+    faiss=True,
+    read_slt=True
+)
+backend.load_model(
+    map_file_path="data/tangentCFT/tsvs/slt_encoder.tsv",
+    model_file_path="data/tangentCFT/vectors/slt_model",
+    encoded_file_path="data/tangentCFT/jsonl/encoded.jsonl"
+)
+
+backend.encoded_file_path = "data/tangentCFT/jsonl/encoded.jsonl"
+backend.read_slt = True
+
+
+
+
+ENCODED_FILE_PATH = "data/tangentCFT/jsonl/encoded.jsonl"
+INDEX_PATH = "data/tangentCFT/jsonl/encoded_index.json"
+FAISS_INDEX_PATH = "data/tangentCFT/slt_index.faiss"
+
+print("Loading FAISS index...")
+faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+
 _model = None
 def get_model():
     """
@@ -66,26 +106,112 @@ def get_model():
     return _model
 
 # Model for results summary
-generation_model = pipeline("text-generation", model="mistralai/Mistral-7B-v0.3")
+# generation_model = pipeline("text-generation", model="mistralai/Mistral-7B-v0.3")
+
+@app.route('/')
+def home():
+    return "Mathmex backend is running! Use /api/search, /api/summarize, or /api/speech-to-latex for requests."
 
 @app.route("/api/search", methods=["POST"])
-def search():
+def formula_search():
+    """
+    Search for mathematical formulas using TangentCFT.
+    Expects JSON input: {"query": "a^2+b^2=c^2"}
+    Returns: a list of matching formulas' visual ids with their scores.
+    """
     data = request.get_json()
-    query = data.get('query', '')
-    sources = data.get('sources', [])
-    media_types = data.get('mediaTypes', [])
-    do_enhance = data.get('do_enhance', False)
-    diversify = data.get('diversify', False) 
+    raw_query = data.get("query")
+    query_ml = format_for_tangent_cft_search(raw_query)
+    query_tuple = get_query_tuple(query_ml)
+    if not query_tuple:
+        return jsonify({"error": "No query provided"}), 400
     
-    if not query:
-        return jsonify({'error': 'No query provided'}), 400
-
     try:
-        results = perform_search(query, sources, media_types, do_enhance, diversify)
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
+        query_dict = {"user_query": query_tuple}
 
-    return jsonify({'results': results, 'total': len(results)})
+        top_results = backend.faiss_search(
+            query=query_dict,
+            encoded_file_path=ENCODED_FILE_PATH,
+            top_k=20,
+            use_cuda=False,
+            faiss_index_path=FAISS_INDEX_PATH,
+            faiss_index=faiss_index
+        )
+        top_results_clean = convert_numpy(top_results)
+        top_results_sorted = dict(
+            sorted(
+                top_results_clean["user_query"].items(),  # use .items() to get (id, score)
+                key=lambda x: x[1],                       # sort by the score
+                reverse=True
+            )[:10]
+        )
+        return jsonify(top_results_sorted)
+    except Exception as e:
+        print(f"TangentCFT search error: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+def get_query_tuple(mathml_string, read_slt=True):
+    """
+    Converts a single MathML formula string into TangentCFT tuples.
+    Returns: {"user_query": list_of_tuples}
+    """
+    try:
+        # Handle trivial single-character cases (like "x")
+        if len(mathml_string) == 1 and mathml_string.isalnum():
+            return [(mathml_string,)]
+
+        # Try tuple extraction using the same logic as get_query()
+        lst_tuples = backend.data_reader.extract_tuples_from_math(mathml_string, read_slt)
+        if lst_tuples is None or len(lst_tuples) == 0:
+            print("Tuple extraction returned None or empty.")
+            return None
+        
+        return lst_tuples
+
+    except Exception as e:
+        print(f"Error extracting tuples from formula: {e}")
+        traceback.print_exc()
+        return None
+
+def convert_numpy(obj):
+    """
+    Recursively convert NumPy types in obj to native Python types.
+    Works on lists, dicts, tuples, etc.
+    """
+    if isinstance(obj, dict):
+        return {k: convert_numpy(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy(x) for x in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy(x) for x in obj)
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        return float(obj)
+    else:
+        return obj
+
+
+
+# # OLD SEARCH FUNCTION
+# def search():
+#     data = request.get_json()
+#     query = data.get('query', '')
+#     sources = data.get('sources', [])
+#     media_types = data.get('mediaTypes', [])
+#     do_enhance = data.get('do_enhance', False)
+#     diversify = data.get('diversify', False) 
+    
+#     if not query:
+#         return jsonify({'error': 'No query provided'}), 400
+
+#     try:
+#         results = perform_search(query, sources, media_types, do_enhance, diversify)
+#     except ValueError as e:
+#         return jsonify({'error': str(e)}), 400
+
+#     return jsonify({'results': results, 'total': len(results)})
 
 @app.route('/api/summarize', methods=['POST'])
 def summarize():

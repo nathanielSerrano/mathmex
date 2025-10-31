@@ -13,9 +13,11 @@ frontend/dist/
 frontend/package-lock.json
 
 # Data
-backend/data/jsonl
-backend/data/tsvs
-backend/data/vectors
+backend/data/jsonl/
+backend/data/tsvs/
+backend/data/vectors/
+
+backend/data/tangentCFT/
 
 # Vectorization/embedding model
 backend/models
@@ -37,3 +39,6 @@ machine-learning/checkpoints
 
 # Local env's
 *.env
+
+venv/
+

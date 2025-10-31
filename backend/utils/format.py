@@ -1,4 +1,6 @@
 import re
+from latex2mathml.converter import convert as latex2mathml
+import xml.etree.ElementTree as ET
 
 def format_for_mathmex(latex):
     """
@@ -48,3 +50,41 @@ def format_for_mathlive(text: str) -> str:
     pattern = re.compile(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)')
 
     return pattern.sub(r'$\1$', text)
+
+def format_for_tangent_cft_search(latex_str: str) -> str:
+    """
+    Converts a LaTeX string to TangentCFT-compatible MathML format.
+
+    Example output for "a^2+b^2=c^2":
+    "<math xmlns=\"http://www.w3.org/1998/Math/MathML\" alttext=\"a^2+b^2=c^2\" 
+      class=\"ltx_Math\" display=\"block\"><semantics>...</semantics></math>"
+    """
+    # Convert LaTeX to Presentation MathML
+    pmml_full = latex2mathml(latex_str)
+
+    # Parse the PMML string and extract the correct structure
+    try:
+        root = ET.fromstring(pmml_full)  # Parse the MathML string
+        semantics = root.find(".//{http://www.w3.org/1998/Math/MathML}semantics")  # Find the <semantics> tag
+        if semantics is not None:
+            # Extract the <mrow> content inside <semantics>
+            mrow = semantics.find("{http://www.w3.org/1998/Math/MathML}mrow")
+            if mrow is not None:
+                pmml_body = ET.tostring(mrow, encoding="unicode")  # Convert <mrow> to string
+            else:
+                pmml_body = ET.tostring(semantics, encoding="unicode")  # Fallback to <semantics> content
+        else:
+            pmml_body = pmml_full  # Fallback to the full PMML if <semantics> is missing
+    except ET.ParseError as e:
+        print(f"Error parsing PMML: {e}")
+        pmml_body = pmml_full  # Fallback to the full PMML if parsing fails
+
+    # Wrap it in the TangentCFT <math> format
+    tangentcft_mathml = (
+        f'<math xmlns="http://www.w3.org/1998/Math/MathML" '
+        f'alttext="{latex_str}" class="ltx_Math" display="block">'
+        f'<semantics>{pmml_body}</semantics></math>'
+    )
+
+    return tangentcft_mathml
+
