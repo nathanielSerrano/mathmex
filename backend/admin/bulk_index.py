@@ -27,7 +27,7 @@ MODEL = config.get('general', 'model')
 # Name of the data source and index (change as needed)
 SOURCE_NAME = ''
 INDEX_NAME = f'mathmex_{SOURCE_NAME}'
-JSONL_FILE_PATH = f'../data/jsonl/{SOURCE_NAME}.jsonl'
+JSONL_FILE_PATH = f'../data/jsonl/mathmex_{SOURCE_NAME}.jsonl'
 
 # Suppress the security warning from using a self-signed cert
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
@@ -75,7 +75,7 @@ def main():
 
     try:
         # Perform the bulk upload using the OpenSearch helpers.bulk utility
-        success_count, errors = bulk(client, generate_bulk_actions(JSONL_FILE_PATH, INDEX_NAME), chunk_size=500,
+        success_count, errors = bulk(client, generate_bulk_actions(JSONL_FILE_PATH, INDEX_NAME), chunk_size=100,
                                      request_timeout=60)
 
         print("\nBulk upload complete!")

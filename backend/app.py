@@ -17,7 +17,22 @@ import saytex
 import os
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from utils.format import format_for_mathmex, format_for_mathlive
+from utils.format import format_for_mathmex, format_for_mathlive, format_for_tangent_cft_search
+import sys
+import io
+import faiss
+import csv
+import tempfile
+import os
+import traceback
+import subprocess
+import tempfile
+
+sys.path.append(os.path.expanduser("../../formula-search"))
+
+from tangent_cft_back_end import TangentCFTBackEnd
+from Embedding_Preprocessing.encoder_tuple_level import TupleTokenizationMode
+
 
 # Create the Flask application instance
 app = Flask(__name__)
@@ -32,12 +47,13 @@ load_dotenv()
 config = configparser.ConfigParser()
 config.read( os.getenv("BACKEND_CONFIG") )
 
+
 # OpenSearch Client Configuration from file
 OPENSEARCH_HOST = config.get('opensearch', 'host')
-
-OPENSEARCH_USER = config.get('admin', 'user')
-OPENSEARCH_PASSWORD = config.get('admin', 'password')
-
+OPENSEARCH_PORT = config.getint('opensearch', 'port') # Use getint for numbers
+OPENSEARCH_USER = config.get('dev', 'user')
+OPENSEARCH_PASSWORD = config.get('dev', 'password')
+# INDEX_NAME = config.get('opensearch', 'index_name')
 MODEL = config.get('general', 'model')
 
 # Flask App Configuration from file
@@ -46,12 +62,42 @@ FLASK_DEBUG = config.getboolean('flask_app', 'debug')
 
 # OpenSearch client
 client = OpenSearch(
-    hosts=[{'host': OPENSEARCH_HOST, 'port': 443}],
+    hosts=[{'host': OPENSEARCH_HOST, 'port': OPENSEARCH_PORT}],
     http_auth=(OPENSEARCH_USER, OPENSEARCH_PASSWORD),
     use_ssl=True,
     verify_certs=False,
     ssl_show_warn=False
 )
+
+# TangentCFT Model
+backend = TangentCFTBackEnd(
+    config_file="../../formula-search/Configuration/config/config_1",
+    path_data_set="../../formula-search/ARQMathDataset",
+    is_wiki=False,
+    streaming=True,
+    read_slt=True,
+    queries_directory_path="../../ARQMathQueries/test_SLT.tsv",
+    faiss=True
+)
+
+# Load pretrained model
+backend.load_model(
+    map_file_path="data/tsvs/TangentCFT/slt_encoder.tsv",
+    model_file_path="data/vectors/TangentCFT/slt_model",
+    embedding_type=TupleTokenizationMode(3),  # corresponds to --et 3
+    ignore_full_relative_path=True,
+    tokenize_all=False,
+    tokenize_number=True
+)
+
+print("TangentCFT model loaded successfully!")
+
+ENCODED_FILE_PATH = "data/jsonl/TangentCFT/encoded.jsonl"
+INDEX_PATH = "data/jsonl/TangentCFT/encoded_index.json"
+FAISS_INDEX_PATH = "data/jsonl/TangentCFT/slt_index.faiss"
+
+print("Loading FAISS index...")
+faiss_index = faiss.read_index(FAISS_INDEX_PATH)
 
 _model = None
 def get_model():
@@ -66,26 +112,126 @@ def get_model():
     return _model
 
 # Model for results summary
-generation_model = pipeline("text-generation", model="mistralai/Mistral-7B-v0.3")
+# generation_model = pipeline("text-generation", model="mistralai/Mistral-7B-v0.3")
+
+@app.route('/')
+def home():
+    return "Mathmex backend is running! Use /api/search, /api/summarize, or /api/speech-to-latex for requests."
 
 @app.route("/api/search", methods=["POST"])
-def search():
+def formula_search():
+    """
+    Search for mathematical formulas using TangentCFT.
+    Expects JSON input: {"query": "a^2+b^2=c^2"}
+    Returns: a list of matching formulas' visual ids with their scores.
+    """
     data = request.get_json()
-    query = data.get('query', '')
+    # query = data.get('query', '')
     sources = data.get('sources', [])
     media_types = data.get('mediaTypes', [])
     do_enhance = data.get('do_enhance', False)
     diversify = data.get('diversify', False) 
-    
-    if not query:
-        return jsonify({'error': 'No query provided'}), 400
 
+    data = request.get_json()
+    raw_query = data.get("query")
+    print(f"Received Query: {raw_query}. Running Retrieval...")
+    query_ml = format_for_tangent_cft_search(raw_query)
+    query_file = write_temp_query_tsv(query_ml)
+
+    backend.data_reader.queries_dir_path = query_file
+
+    text_trap = io.StringIO()
+
+    # Suppress print statements while retrieval is performed.
+    sys.stdout = text_trap
+
+    query_vector = backend.retrieval(
+        encoded_file_path=ENCODED_FILE_PATH,
+        embedding_type=TupleTokenizationMode(3),
+        ignore_full_relative_path=True,
+        tokenize_all=False,
+        tokenize_number=True,
+        streaming=True,
+        faiss=True,
+        faiss_index=faiss_index,
+        single_query=True,
+        do_retrieval=False
+    )
     try:
-        results = perform_search(query, sources, media_types, do_enhance, diversify)
+        results = perform_search(raw_query, sources, media_types, do_enhance, diversify, custom_vec=True, custom_query_vec=query_vector)
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
+    
+    sys.stdout = sys.__stdout__
 
     return jsonify({'results': results, 'total': len(results)})
+
+def write_temp_query_tsv(mathml_string: str):
+    """
+    Writes a temporary TSV with one query entry matching MSE format.
+    Returns the path to the file.
+    """
+    # Make sure the MathML is not wrapped in extra quotes
+    mathml_string = mathml_string.strip().strip('"').strip("'")
+
+    tmp_tsv = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".tsv", delete=False, newline='', encoding="utf-8"
+    )
+
+    writer = csv.DictWriter(
+        tmp_tsv,
+        delimiter="\t",
+        fieldnames=["id", "topic_id", "thread_id", "type", "formula"]
+    )
+    writer.writeheader()
+    writer.writerow({
+        "id": "user_query",
+        "topic_id": "A.000",
+        "thread_id": "0000000",
+        "type": "title",
+        "formula": mathml_string
+    })
+    tmp_tsv.close()
+    return tmp_tsv.name
+
+def convert_numpy(obj):
+    """
+    Recursively convert NumPy types in obj to native Python types.
+    Works on lists, dicts, tuples, etc.
+    """
+    if isinstance(obj, dict):
+        return {k: convert_numpy(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy(x) for x in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy(x) for x in obj)
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        return float(obj)
+    else:
+        return obj
+
+
+
+# # OLD SEARCH FUNCTION
+# def search():
+#     data = request.get_json()
+#     query = data.get('query', '')
+#     sources = data.get('sources', [])
+#     media_types = data.get('mediaTypes', [])
+#     do_enhance = data.get('do_enhance', False)
+#     diversify = data.get('diversify', False) 
+    
+#     if not query:
+#         return jsonify({'error': 'No query provided'}), 400
+
+#     try:
+#         results = perform_search(query, sources, media_types, do_enhance, diversify)
+#     except ValueError as e:
+#         return jsonify({'error': str(e)}), 400
+
+#     return jsonify({'results': results, 'total': len(results)})
 
 @app.route('/api/summarize', methods=['POST'])
 def summarize():
@@ -167,7 +313,7 @@ def speech_to_latex():
         return jsonify({'error': str(e)}), 500
 
 # # # UTIL FUNCTIONS # # #
-def perform_search(query, sources, media_types, do_enhance=False, diversify=False):
+def perform_search(query, sources, media_types, do_enhance=False, diversify=False, custom_vec=False, custom_query_vec=None):
     if not query:
         raise ValueError("No query provided")
 
@@ -198,7 +344,10 @@ def perform_search(query, sources, media_types, do_enhance=False, diversify=Fals
 
     model = get_model()
     query_formatted = format_for_mathmex(query)
-    query_vec = model.encode(query_formatted).tolist()
+    if custom_vec:
+        query_vec = custom_query_vec
+    else:
+        query_vec = model.encode(query_formatted).tolist()
 
     query_body = {
         "from": 0,

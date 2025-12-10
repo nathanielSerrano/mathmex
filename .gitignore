@@ -37,3 +37,5 @@ machine-learning/checkpoints
 
 # Local env's
 *.env
+backend/collection_results.jsonl
+backend/encoded.jsonl

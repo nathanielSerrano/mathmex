@@ -21,7 +21,7 @@ USER = config.get('admin', 'user')
 PASSWORD = config.get('admin', 'password')
 
 # Name of the index to create (change as needed)
-INDEX_NAME = 'test'
+INDEX_NAME = ''
 
 # --- Connect ---
 # Initialize the OpenSearch client

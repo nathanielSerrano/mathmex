@@ -9,7 +9,7 @@ import configparser
 
 # --- Load Configuration from config.ini ---
 config = configparser.ConfigParser()
-config.read('../config.ini')
+config.read('backend/config.ini')
 
 # OpenSearch
 OPENSEARCH_HOST = config.get('opensearch', 'host')
